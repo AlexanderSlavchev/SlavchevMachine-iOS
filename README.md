@@ -26,6 +26,88 @@ In Xcode:
 
 The project uses Xcode 16+'s filesystem-synchronized groups, so any `.swift` you add anywhere under `SlavchevMachine/` is picked up automatically — no need to edit `project.pbxproj`. The `Resources/Kits/` folder is bundled with WAV samples for the two built-in drum kits (`cajon`, `AlexDrumKit`).
 
+## Running on a real iPhone
+
+You can run on any iPhone with a **free** Apple ID — no $99 Apple Developer membership needed. Free signing lets you install the app on devices you own; the build expires every 7 days and re-installs with another ⌘R.
+
+### One-time setup
+
+**1. Sign in to your Apple ID inside Xcode**
+
+- Xcode → Settings (⌘,) → **Accounts** tab
+- `+` (bottom-left) → **Apple ID** → enter your Apple ID + password
+- Once added, you'll see a free "Personal Team" listed under that Apple ID
+
+**2. Configure code signing for the project**
+
+- Open `SlavchevMachine.xcodeproj` in Xcode
+- Click the blue **SlavchevMachine** project icon at the top of the left sidebar
+- Select the **SlavchevMachine** *target* (under TARGETS)
+- Open the **Signing & Capabilities** tab
+- Check **Automatically manage signing**
+- For **Team**, pick your **Personal Team (your name)**
+- The **Bundle Identifier** is `com.slavchev.machine` by default. If Xcode complains that it's taken (Apple requires unique IDs even for free signing), change it to something like `com.yourname.slavchevmachine`
+
+**3. Connect your iPhone**
+
+- Plug iPhone into Mac with a USB-C / Lightning cable (Wi-Fi pairing works too — see [§Wireless](#wireless-debugging) below)
+- On first connection iPhone asks **"Trust this Computer?"** — tap **Trust** and enter your passcode
+- In Xcode's top toolbar, click the run-destination dropdown (says "iPhone 16" or similar) and pick your **real device** from the list — it will appear under "iOS Device" once paired
+
+**4. Enable Developer Mode on the iPhone** *(iOS 16+)*
+
+- First time you try to run on a real device, iOS will show an alert saying "Developer Mode required"
+- On the iPhone: **Settings → Privacy & Security → Developer Mode → toggle ON**
+- iPhone will reboot — after reboot, confirm "Turn On" when prompted
+
+**5. Build & install**
+
+- In Xcode press **⌘R** (or click the ▶ Play button)
+- First time, Xcode builds + uploads the `.app` to your device (~30–60s)
+- iPhone will show: *"Untrusted Developer"* — this is normal for free signing
+  - On iPhone: **Settings → General → VPN & Device Management → Developer App** → your Apple ID → **Trust**
+- Now go back to Xcode and press **⌘R** again — app launches on the iPhone
+
+### Permissions you'll see on first launch
+
+- **Microphone access** — the looper needs it to record audio loops. Tap **Allow**. If you tap Don't Allow, the looper will silently fail on first arm; you can re-enable it later in **Settings → SlavchevMachine → Microphone**.
+- **Bluetooth** — only if you pair a Bluetooth page-turner / external keyboard for hardware transport control. The app itself doesn't request it; iOS prompts the first time you use a BLE input.
+
+### Hardware key control with a Bluetooth foot pedal
+
+- Pair your foot pedal / page-turner in **iPhone Settings → Bluetooth** first
+- In the app, **long-press** any transport button (PLAY · STOP · ‹ · › · B · FILL 1 · FILL 2) → context menu → tap **LEARN BT KEY** → press the pedal once → it's bound
+- **Important iOS limitation:** keys only work while the app is in the **foreground**. Unlike Android's AccessibilityService, iOS does not let third-party apps receive HID key events in the background. Audio keeps playing in the background (background-audio capability), but to advance scenes / trigger fills via the pedal you need the app visible.
+- Looper REC / STOP keys: bind them from inside the **LOOPER** pane → REC KEY / STOP KEY → LEARN.
+
+### Wireless debugging
+
+Once paired over USB at least once, you can run wirelessly:
+
+- Xcode → **Window → Devices and Simulators**
+- Select your iPhone
+- Check **Connect via network**
+- Unplug — iPhone appears in the run-destination dropdown with a Wi-Fi 🛜 icon next to its name
+- Press **⌘R** as normal
+
+### Re-signing after 7 days
+
+With a free Apple ID, the provisioning profile expires after 7 days and the app stops launching from the home screen ("Untrusted" alert reappears). To extend it just plug the iPhone in and press ⌘R again — Xcode re-signs and reinstalls in ~10s, no data is lost.
+
+If you upgrade to a **paid Apple Developer Program** ($99/yr) the signing lasts 1 year and you can also distribute via TestFlight / App Store.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Could not launch "SlavchevMachine"` + "Untrusted Developer" | iPhone Settings → General → VPN & Device Management → trust your developer profile |
+| Xcode shows *"No code signing identities found"* | Signing & Capabilities → tick "Automatically manage signing" + pick your Personal Team |
+| Bundle ID conflict (`com.slavchev.machine` is taken) | Change Bundle Identifier to `com.yourname.slavchevmachine` |
+| No audio / very quiet on iPhone | Increase phone media volume, not ringer volume. Lock-screen rocker is ringer; use the side buttons while the app is foreground for media |
+| Looper records silence | Mic permission was denied. Settings → SlavchevMachine → Microphone → ON |
+| Latency feels high vs Android | Open Settings → SlavchevMachine → make sure no other audio apps are running. iOS picks lowest latency device available; AirPods Bluetooth add ~100ms (use wired / built-in speaker for testing) |
+| App crashes at launch with codesign error | Run **Product → Clean Build Folder** (⇧⌘K) then ⌘R again |
+
 ## What's implemented
 
 Per the spec:
