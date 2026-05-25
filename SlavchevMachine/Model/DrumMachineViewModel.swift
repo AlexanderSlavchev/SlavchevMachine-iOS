@@ -119,7 +119,17 @@ final class DrumMachineViewModel: ObservableObject {
             guard let self = self, let lp = self.audio.looper else { return }
             Task { @MainActor in
                 let s = lp.state
-                if s != self.looperState { self.looperState = s }
+                if s != self.looperState {
+                    let wasRecording = self.looperState == .recording || self.looperState == .endArmed
+                    let nowPlaying = s == .playing
+                    self.looperState = s
+                    // When the loop finalises (recording → playing), recalculate compensation
+                    // using current session latency readings — they're most accurate now that
+                    // the input has been actively delivering for a while.
+                    if wasRecording && nowPlaying {
+                        self.audio.recalculateLoopLatency()
+                    }
+                }
             }
         }
     }
@@ -380,14 +390,18 @@ final class DrumMachineViewModel: ObservableObject {
 
     func loadKit(_ kit: KitRef) {
         let rr = KitStore.roundRobinSourcesForKit(kit)
-        let single = KitStore.sourcesForKit(kit)
+        var loadedMultiVariant = 0
         for pad in 0..<AudioConstants.numPads {
-            let sources = rr[pad] ?? (single[pad].map { [$0] } ?? [])
+            let sources = rr[pad] ?? []
             let samples = sources.compactMap { $0.decode(targetSampleRate: Double(audio.sampleRate)) }
             audio.setPadSamples(pad: pad, samples: samples)
             padHasSample[pad] = !samples.isEmpty
             padSources[pad] = sources.first
+            if samples.count > 1 { loadedMultiVariant += 1 }
         }
+        #if DEBUG
+        print("[Kit] loaded '\(kit.name)' — \(loadedMultiVariant) pad(s) have round-robin variants")
+        #endif
     }
 
     func assignPad(_ pad: Int, sources: [PadSampleSource]) {

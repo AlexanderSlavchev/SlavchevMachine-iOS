@@ -59,6 +59,10 @@ struct SettingsDialog: View {
                         .foregroundStyle(.white.opacity(0.6))
                 }
 
+                section("AUDIO ROUTING", accent: accent) {
+                    AudioRoutingSection()
+                }
+
                 section("TEMPO STEP", accent: accent) {
                     tempoStepRow(title: "STEP UP +", value: $stepUp, action: .tempoStepUp,
                                  onCommit: { SettingsStore.tempoStepUp = stepUp }, accent: accent)

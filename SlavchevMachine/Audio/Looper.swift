@@ -149,25 +149,35 @@ final class Looper {
 
     // MARK: - Audio I/O
 
-    /// Called by the input tap with float mono frames.
+    /// Called by the input tap with float mono frames. Always updates input peak meter (so
+    /// the user can see signal level even before pressing record). Writes to the buffer only
+    /// when in recording / endArmed state. Publishes the buffer for live monitoring if enabled.
     func appendInput(_ samples: UnsafeBufferPointer<Float>) {
+        // Always update the peak meter so user can verify input is alive.
+        var peak: Float = 0
+        for i in 0..<samples.count {
+            let a = abs(samples[i] * inputGainLin)
+            if a > peak { peak = a }
+        }
+        if peak > inputPeakValue { inputPeakValue = peak }
+
+        // Capture into the loop buffer only when in a recording state.
         let s = LooperState(rawValue: Int(stateRaw)) ?? .empty
         guard s == .recording || s == .endArmed else { return }
         var pos = recordLen
-        var peak: Float = 0
         for i in 0..<samples.count {
             if pos >= bufferCapacity { break }
-            let v = samples[i] * inputGainLin
-            buffer[pos] = v
-            let a = abs(v)
-            if a > peak { peak = a }
+            buffer[pos] = samples[i] * inputGainLin
             pos += 1
         }
         recordLen = pos
-        if peak > inputPeakValue { inputPeakValue = peak }
     }
 
     /// Called by the audio render callback. Mixes mono loop into stereo `out`, applies output gain and EQ.
+    /// Also (when DEBUG) tracks the mixed peak so a separate diagnostic can confirm playback audibility.
+    /// Note: live monitoring is NOT done here — it's routed through the engine's input → mixer → main
+    /// path with volume control (see AudioEngine.setMonitorEnabled). That keeps the monitor in the
+    /// engine's optimised render pipeline (no cross-thread copies → much lower latency).
     func mixInto(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>, frameCount: Int) {
         let s = LooperState(rawValue: Int(stateRaw)) ?? .empty
         guard s == .playing, loopFrames > 0 else { return }
@@ -181,6 +191,7 @@ final class Looper {
             snapTarget = -1
         }
         let lat = latencyCompFrames
+        var mixedPeak: Float = 0
         scratch.withUnsafeMutableBufferPointer { sp in
             for n in 0..<frameCount {
                 let read = (playPos + lat) % loopFrames
@@ -194,9 +205,26 @@ final class Looper {
                 let v = sp[n] * gain
                 left[n] += v
                 right[n] += v
+                if abs(v) > mixedPeak { mixedPeak = abs(v) }
             }
         }
+        #if DEBUG
+        playbackPeakValue = max(playbackPeakValue, mixedPeak)
+        #endif
     }
+
+    #if DEBUG
+    /// Atomic-ish read for the playback diagnostic (UI poll).
+    func consumePlaybackPeak() -> Float {
+        let p = playbackPeakValue
+        playbackPeakValue = 0
+        return p
+    }
+    private var playbackPeakValue: Float = 0
+    #endif
+
+    // Live monitoring is handled by AudioEngine via the input → mixer → main-mixer path —
+    // not by Looper. (See AudioEngine.setMonitorEnabled.)
 
     /// Snapshot and reset peak for UI metering.
     func consumePeak() -> Float {
