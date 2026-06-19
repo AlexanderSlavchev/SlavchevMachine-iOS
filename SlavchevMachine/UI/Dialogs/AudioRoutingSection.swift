@@ -11,6 +11,8 @@ struct AudioRoutingSection: View {
     @State private var forceSpeaker: Bool = SettingsStore.forceSpeakerOutput
     @State private var monitorInput: Bool = SettingsStore.monitorInput
     @State private var latencyOffset: Double = SettingsStore.latencyOffsetMs
+    @State private var channelCount: Int = 1
+    @State private var showRouting: Bool = false
 
     var body: some View {
         let accent = vm.accent.tokens
@@ -141,11 +143,36 @@ struct AudioRoutingSection: View {
                     }
                 }
             }
+
+            Divider().background(accent.dim).padding(.vertical, 4)
+
+            // LOOPER ROUTING — only meaningful with a multi-channel input.
+            HStack {
+                Text("LOOPER ROUTING")
+                    .font(SMFont.mono(9, weight: .bold))
+                    .tracking(2)
+                    .foregroundStyle(.white.opacity(0.55))
+                Spacer()
+                Text("\(channelCount) CH IN")
+                    .font(SMFont.mono(10, weight: .bold))
+                    .foregroundStyle(channelCount > 1 ? accent.hex : .white.opacity(0.4))
+            }
+            PillButton(label: "CONFIGURE INPUTS", accent: accent) { showRouting = true }
+                .disabled(channelCount <= 1)
+                .opacity(channelCount <= 1 ? 0.4 : 1)
+            Text(channelCount > 1
+                 ? "Record several input channels as separate, individually-mutable looper tracks."
+                 : "Connect a multi-channel input (USB interface) to record more than one channel.")
+                .font(SMFont.mono(8))
+                .foregroundStyle(.white.opacity(0.4))
         }
         .onAppear { refresh() }
         .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)) { _ in
             // Devices plugged/unplugged — refresh on main queue.
             DispatchQueue.main.async { refresh() }
+        }
+        .sheet(isPresented: $showRouting) {
+            LooperRoutingDialog().environmentObject(vm)
         }
     }
 
@@ -155,6 +182,7 @@ struct AudioRoutingSection: View {
         currentOutputName = vm.audio.currentOutputName()
         forceSpeaker = SettingsStore.forceSpeakerOutput
         latencyOffset = SettingsStore.latencyOffsetMs
+        channelCount = vm.audio.availableInputChannelCount()
     }
 
     private func adjustOffset(_ delta: Double) {

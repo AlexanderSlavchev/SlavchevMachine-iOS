@@ -56,8 +56,8 @@ struct SceneLibraryDialog: View {
                 let scene = vm.snapshotScene(name: name, includeLoop: includeLoop)
                 var srcs = vm.padSources
                 for i in 0..<srcs.count where !vm.padHasSample[i] { srcs[i] = nil }
-                let pcm = includeLoop ? vm.audio.looper?.exportPcm() : nil
-                _ = SceneStore.saveScene(setlist: setlist, scene: scene, padSources: srcs, looperPcm: pcm)
+                let tracks = includeLoop ? vm.audio.looper?.exportTracks() : nil
+                _ = SceneStore.saveScene(setlist: setlist, scene: scene, padSources: srcs, looperTracks: tracks)
                 vm.setlist = setlist
                 vm.sceneName = name
                 reload()
@@ -197,7 +197,7 @@ struct SceneLibraryDialog: View {
             let existing = SceneStore.listScenes(setlist: target)
             while existing.contains(newName) { newName += " (copy)" }
             var sc = s; sc.name = newName
-            _ = SceneStore.saveScene(setlist: target, scene: sc, padSources: srcs, looperPcm: nil)
+            _ = SceneStore.saveScene(setlist: target, scene: sc, padSources: srcs, looperTracks: nil)
             reload()
             copiedScene = nil
         }

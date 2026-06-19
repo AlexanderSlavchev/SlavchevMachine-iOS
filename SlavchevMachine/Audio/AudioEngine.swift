@@ -329,6 +329,50 @@ final class AudioEngine {
         AVAudioSession.sharedInstance().availableInputs ?? []
     }
 
+    /// Number of input channels the current input device can deliver (built-in mic = 1, a
+    /// class-compliant USB interface can be 2 / 4 / 8…). Drives Looper Routing availability.
+    func availableInputChannelCount() -> Int {
+        max(1, AVAudioSession.sharedInstance().maximumInputNumberOfChannels)
+    }
+
+    /// Human labels for each selectable input channel (hardware channel names when the port
+    /// exposes them, else "INPUT n").
+    func inputChannelNames() -> [String] {
+        let count = availableInputChannelCount()
+        let descs = currentInput()?.channels ?? []
+        return (0..<count).map { i in
+            if i < descs.count, !descs[i].channelName.isEmpty { return descs[i].channelName }
+            return "INPUT \(i + 1)"
+        }
+    }
+
+    /// Apply the saved Looper Routing (which hardware channels feed which looper track). Clamps
+    /// to what the current device offers, asks the session to deliver enough channels, and rebuilds
+    /// the input tap if it's already live so the new channel count takes effect immediately.
+    func applyLooperRouting() {
+        let session = AVAudioSession.sharedInstance()
+        let available = max(1, availableInputChannelCount())
+        var desired = SettingsStore.looperRoutingChannels.filter { $0 >= 0 && $0 < available }
+        if desired.isEmpty { desired = [0] }
+        if desired.count > Looper.maxTracks { desired = Array(desired.prefix(Looper.maxTracks)) }
+        looperChannelMap = desired
+        looper?.setActiveTracks(desired.count)
+
+        // Request enough channels to cover the highest selected index.
+        let needed = (desired.max() ?? 0) + 1
+        let maxCh = session.maximumInputNumberOfChannels
+        let want = maxCh > 0 ? min(needed, maxCh) : needed
+        if session.inputNumberOfChannels != want {
+            try? session.setPreferredInputNumberOfChannels(want)
+        }
+        if inputTapInstalled {
+            rebuildGraph(reason: "looper routing")
+        }
+    }
+
+    /// The hardware channel indices currently mapped to looper tracks 0..n-1.
+    func looperRoutingMap() -> [Int] { looperChannelMap }
+
     /// Currently active input (whatever iOS resolved to).
     func currentInput() -> AVAudioSessionPortDescription? {
         AVAudioSession.sharedInstance().currentRoute.inputs.first
@@ -419,7 +463,12 @@ final class AudioEngine {
     /// Two separate restarts would each trigger their own config-change notification, causing a loop.
     private func performReconfig() {
         if detectReconfigLoop() { return }
-        print("[Audio] performing graph rebuild")
+        rebuildGraph(reason: "config change")
+    }
+
+    /// Full single stop/start graph rebuild. Used by config-change handling and by routing changes.
+    private func rebuildGraph(reason: String) {
+        print("[Audio] performing graph rebuild (\(reason))")
         let hadInputTap = inputTapInstalled
 
         // Cleanup old graph state.
@@ -431,6 +480,8 @@ final class AudioEngine {
         inputSilentSink = nil
         inputConverter = nil
         inputConverterSourceFormat = nil
+        inputMultiConverter = nil
+        inputMultiSourceFormat = nil
 
         if avEngine.isRunning { avEngine.stop() }
 
@@ -445,6 +496,8 @@ final class AudioEngine {
             print("[Audio] reconfig start failed: \(error) — will retry asynchronously")
             attemptEngineRestart(reason: "reconfig fallback")
         }
+        // Mark as "our own" so the resulting config-change notification gets skipped.
+        lastReconfigCompletedAt = Date()
     }
 
     func allNotesOff() {
@@ -596,6 +649,11 @@ final class AudioEngine {
     private var inputConverter: AVAudioConverter?
     private var inputConverterSourceFormat: AVAudioFormat?
     private var inputMonoFormat: AVAudioFormat?
+    // Multichannel capture (Looper Routing). Converter is rebuilt when the source format changes.
+    private var inputMultiConverter: AVAudioConverter?
+    private var inputMultiSourceFormat: AVAudioFormat?
+    // Hardware channel index feeding each looper track (track 0..n-1). Default: channel 0 only.
+    private var looperChannelMap: [Int] = [0]
 
     /// Build the input → silent mixer → main mixer path and install the tap.
     /// Caller must ensure engine is stopped; does NOT start the engine.
@@ -638,6 +696,8 @@ final class AudioEngine {
     /// Public entry: prepare the looper to record. Stops engine, wires input tap, restarts.
     func looperStartInput() throws {
         if inputTapInstalled { return }
+        // Make sure the session is set to deliver the routed channel count before the tap installs.
+        applyLooperRouting()
         let wasRunning = avEngine.isRunning
         if wasRunning { avEngine.stop() }
         try wireInputTap()
@@ -661,8 +721,9 @@ final class AudioEngine {
         print("[Audio] input tap installed — current=\(currentInput()?.portName ?? "—")")
     }
 
-    /// Convert the input buffer to mono float32 at the session SR and pump it into the looper.
-    /// Cached converter is rebuilt if/when the input format changes (e.g. BT headset reconnect).
+    /// Route the input buffer to the looper. Default (channel 0 only) keeps the original
+    /// efficient mono path; any other routing reads the selected hardware channels into
+    /// separate looper tracks.
     private func handleInputBuffer(_ buffer: AVAudioPCMBuffer, into lp: Looper) {
         let sourceFormat = buffer.format
 
@@ -675,6 +736,17 @@ final class AudioEngine {
         }
         #endif
 
+        let map = looperChannelMap
+        if map.count == 1 && map[0] == 0 {
+            handleMonoInput(buffer, sourceFormat: sourceFormat, into: lp)
+        } else {
+            handleMappedInput(buffer, sourceFormat: sourceFormat, map: map, into: lp)
+        }
+    }
+
+    /// Down-mix to mono float32 at the session SR and pump into looper track 0.
+    /// Cached converter is rebuilt if/when the input format changes (e.g. BT headset reconnect).
+    private func handleMonoInput(_ buffer: AVAudioPCMBuffer, sourceFormat: AVAudioFormat, into lp: Looper) {
         // Fast path — already mono float32 non-interleaved at the right sample rate.
         if sourceFormat.commonFormat == .pcmFormatFloat32 &&
            sourceFormat.channelCount == 1 &&
@@ -743,6 +815,67 @@ final class AudioEngine {
             let bp = UnsafeBufferPointer(start: ptr, count: Int(outBuf.frameLength))
             lp.appendInput(bp)
         }
+    }
+
+    /// Read the routed hardware channels (`map`) into separate looper tracks. Fast path reads
+    /// float32 planar channels directly; otherwise converts to N-channel float32 at session SR.
+    private func handleMappedInput(_ buffer: AVAudioPCMBuffer, sourceFormat: AVAudioFormat,
+                                   map: [Int], into lp: Looper) {
+        // Fast path — float32 non-interleaved at session SR: read mapped channels directly.
+        if sourceFormat.commonFormat == .pcmFormatFloat32 &&
+           !sourceFormat.isInterleaved &&
+           sourceFormat.sampleRate == Double(sampleRate),
+           let chData = buffer.floatChannelData {
+            let chCount = Int(sourceFormat.channelCount)
+            let frames = Int(buffer.frameLength)
+            guard frames > 0 else { return }
+            var ptrs: [UnsafeBufferPointer<Float>] = []
+            ptrs.reserveCapacity(map.count)
+            for ch in map {
+                let src = chData[ch < chCount ? ch : 0]
+                ptrs.append(UnsafeBufferPointer(start: src, count: frames))
+            }
+            lp.appendInput(tracks: ptrs)
+            return
+        }
+
+        // Slow path — convert to an N-channel float32 buffer at the session SR, then read channels.
+        let chCount = sourceFormat.channelCount
+        guard let multiFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                           sampleRate: Double(sampleRate),
+                                           channels: chCount, interleaved: false) else { return }
+        if inputMultiSourceFormat != sourceFormat {
+            let conv = AVAudioConverter(from: sourceFormat, to: multiFmt)
+            conv?.primeMethod = .none
+            inputMultiConverter = conv
+            inputMultiSourceFormat = sourceFormat
+            #if DEBUG
+            print("[Audio] multichannel converter rebuilt: \(sourceFormat) → \(multiFmt)")
+            #endif
+        }
+        guard let conv = inputMultiConverter else { return }
+        let ratio = Double(sampleRate) / max(sourceFormat.sampleRate, 1)
+        let outCap = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 32)
+        guard let outBuf = AVAudioPCMBuffer(pcmFormat: multiFmt, frameCapacity: outCap) else { return }
+        var err: NSError?
+        var supplied = false
+        _ = conv.convert(to: outBuf, error: &err) { _, status in
+            if supplied { status.pointee = .endOfStream; return nil }
+            supplied = true
+            status.pointee = .haveData
+            return buffer
+        }
+        if err != nil { return }
+        let frames = Int(outBuf.frameLength)
+        guard frames > 0, let chData = outBuf.floatChannelData else { return }
+        let outCh = Int(multiFmt.channelCount)
+        var ptrs: [UnsafeBufferPointer<Float>] = []
+        ptrs.reserveCapacity(map.count)
+        for ch in map {
+            let src = chData[ch < outCh ? ch : 0]
+            ptrs.append(UnsafeBufferPointer(start: src, count: frames))
+        }
+        lp.appendInput(tracks: ptrs)
     }
 
     #if DEBUG

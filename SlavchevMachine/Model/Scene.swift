@@ -27,5 +27,8 @@ struct SceneSnapshot: Codable {
         var latencyComp: Int
         var barOffsets: [Int]
         var eqBands: [SceneEqBand]
+        // Multi-input looper. Optional so scenes saved before this feature still decode.
+        var trackCount: Int?
+        var trackMuted: [Bool]?
     }
 }

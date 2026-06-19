@@ -6,6 +6,7 @@ enum TransportAction: String, CaseIterable, Codable {
     case play, stop, nextScene, previousScene, sectionToggle
     case fill1, fill2, tempoStepUp, tempoStepDown
     case looperRecord, looperStop
+    case looperMute1, looperMute2, looperMute3, looperMute4
 
     var displayName: String {
         switch self {
@@ -20,6 +21,32 @@ enum TransportAction: String, CaseIterable, Codable {
         case .tempoStepDown: return "TEMPO −"
         case .looperRecord: return "LOOPER REC"
         case .looperStop: return "LOOPER STOP"
+        case .looperMute1: return "MUTE IN 1"
+        case .looperMute2: return "MUTE IN 2"
+        case .looperMute3: return "MUTE IN 3"
+        case .looperMute4: return "MUTE IN 4"
+        }
+    }
+
+    /// Looper-mute actions, indexed by track (0-based). nil for non-mute actions.
+    var looperMuteTrack: Int? {
+        switch self {
+        case .looperMute1: return 0
+        case .looperMute2: return 1
+        case .looperMute3: return 2
+        case .looperMute4: return 3
+        default: return nil
+        }
+    }
+
+    /// The mute action for a given track index (0-based), if any.
+    static func looperMute(track: Int) -> TransportAction? {
+        switch track {
+        case 0: return .looperMute1
+        case 1: return .looperMute2
+        case 2: return .looperMute3
+        case 3: return .looperMute4
+        default: return nil
         }
     }
 }

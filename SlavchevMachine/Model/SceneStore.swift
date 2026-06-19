@@ -81,7 +81,7 @@ enum SceneStore {
     }
 
     @discardableResult
-    static func saveScene(setlist: String, scene: SceneSnapshot, padSources: [PadSampleSource?], looperPcm: [Float]? = nil) -> Bool {
+    static func saveScene(setlist: String, scene: SceneSnapshot, padSources: [PadSampleSource?], looperTracks: [[Float]]? = nil) -> Bool {
         let cleanSet = sanitize(setlist)
         let cleanScene = sanitize(scene.name)
         guard !cleanSet.isEmpty, !cleanScene.isEmpty else { return false }
@@ -99,12 +99,14 @@ enum SceneStore {
                     try data.write(to: dst)
                 }
             }
-            // Loop PCM.
-            if let pcm = looperPcm, !pcm.isEmpty {
-                let dst = sceneURL.appendingPathComponent("looper.pcm")
-                pcm.withUnsafeBufferPointer { bp in
-                    let data = Data(buffer: bp)
-                    try? data.write(to: dst)
+            // Loop PCM — one file per track (looper_0.pcm … looper_N.pcm).
+            if let tracks = looperTracks {
+                for (t, pcm) in tracks.enumerated() where !pcm.isEmpty {
+                    let dst = sceneURL.appendingPathComponent(String(format: "looper_%d.pcm", t))
+                    pcm.withUnsafeBufferPointer { bp in
+                        let data = Data(buffer: bp)
+                        try? data.write(to: dst)
+                    }
                 }
             }
             return true
@@ -130,8 +132,7 @@ enum SceneStore {
         return (scene, sources)
     }
 
-    static func loadLooperPcm(setlist: String, name: String) -> [Float]? {
-        let url = rootURL.appendingPathComponent(setlist).appendingPathComponent(name).appendingPathComponent("looper.pcm")
+    private static func readPcm(at url: URL) -> [Float]? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         let count = data.count / MemoryLayout<Float>.size
         var arr = [Float](repeating: 0, count: count)
@@ -141,14 +142,48 @@ enum SceneStore {
         return arr
     }
 
+    /// Load up to `trackCount` looper tracks (looper_0.pcm …). Falls back to the legacy single
+    /// `looper.pcm` (loaded as track 0) for scenes saved before multi-input support.
+    static func loadLooperTracks(setlist: String, name: String, trackCount: Int) -> [[Float]] {
+        let dir = rootURL.appendingPathComponent(setlist).appendingPathComponent(name)
+        var tracks: [[Float]] = []
+        let n = max(1, trackCount)
+        for t in 0..<n {
+            let url = dir.appendingPathComponent(String(format: "looper_%d.pcm", t))
+            if let pcm = readPcm(at: url) {
+                tracks.append(pcm)
+            } else {
+                break
+            }
+        }
+        if tracks.isEmpty, let legacy = readPcm(at: dir.appendingPathComponent("looper.pcm")) {
+            tracks.append(legacy)
+        }
+        return tracks
+    }
+
+    /// Total bytes of all looper PCM files (per-track looper_N.pcm, plus legacy looper.pcm) in a scene.
+    private static func looperBytes(setlist: String, scene: String) -> Int {
+        let dir = rootURL.appendingPathComponent(setlist).appendingPathComponent(scene)
+        var total = 0
+        for t in 0..<Looper.maxTracks {
+            let url = dir.appendingPathComponent(String(format: "looper_%d.pcm", t))
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let size = attrs[.size] as? Int { total += size }
+        }
+        if total == 0,
+           let attrs = try? FileManager.default.attributesOfItem(atPath: dir.appendingPathComponent("looper.pcm").path),
+           let size = attrs[.size] as? Int { total = size }
+        return total
+    }
+
     static func listLoops() -> [LoopEntry] {
         var results: [LoopEntry] = []
         for setlist in listSetlists() {
             for scene in listScenes(setlist: setlist) {
-                let url = rootURL.appendingPathComponent(setlist).appendingPathComponent(scene).appendingPathComponent("looper.pcm")
-                if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-                   let size = attrs[.size] as? Int {
-                    results.append(LoopEntry(setlist: setlist, scene: scene, bytes: size))
+                let bytes = looperBytes(setlist: setlist, scene: scene)
+                if bytes > 0 {
+                    results.append(LoopEntry(setlist: setlist, scene: scene, bytes: bytes))
                 }
             }
         }
@@ -158,8 +193,10 @@ enum SceneStore {
     @discardableResult
     static func deleteLoop(setlist: String, scene: String) -> Bool {
         let sceneURL = rootURL.appendingPathComponent(setlist).appendingPathComponent(scene)
-        let pcmURL = sceneURL.appendingPathComponent("looper.pcm")
-        try? FileManager.default.removeItem(at: pcmURL)
+        for t in 0..<Looper.maxTracks {
+            try? FileManager.default.removeItem(at: sceneURL.appendingPathComponent(String(format: "looper_%d.pcm", t)))
+        }
+        try? FileManager.default.removeItem(at: sceneURL.appendingPathComponent("looper.pcm"))
         // Mark hasLoop = false in scene.json.
         let jsonURL = sceneURL.appendingPathComponent("scene.json")
         if let data = try? Data(contentsOf: jsonURL),

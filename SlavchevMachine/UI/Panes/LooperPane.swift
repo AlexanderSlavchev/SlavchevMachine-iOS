@@ -23,6 +23,7 @@ struct LooperPane: View {
             controlsSection
         }
         .onAppear {
+            vm.refreshLooperRouting()
             Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
                 inputPeak = vm.audio.looper?.consumePeak() ?? 0
             }
@@ -44,6 +45,74 @@ struct LooperPane: View {
             }
             LearnKeyRow(label: "REC KEY", action: .looperRecord, accent: accent)
             LearnKeyRow(label: "STOP KEY", action: .looperStop, accent: accent)
+
+            if vm.looperActiveTracks > 1 {
+                Divider().background(accent.dim).padding(.vertical, 2)
+                Text("INPUTS · MUTE & LEARN")
+                    .font(SMFont.mono(8, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(.white.opacity(0.55))
+                ForEach(Array(0..<vm.looperActiveTracks), id: \.self) { t in
+                    LooperInputMuteRow(track: t, accent: accent)
+                }
+            }
+        }
+    }
+}
+
+/// One routed input: MUTE toggle (affects an already-recorded loop live) + a learnable
+/// Bluetooth page-turner key for that mute, mirroring the REC/STOP LearnKeyRow.
+struct LooperInputMuteRow: View {
+    @EnvironmentObject var vm: DrumMachineViewModel
+    let track: Int
+    let accent: AccentTokens
+
+    var body: some View {
+        let muted = vm.looperTrackMuted[track]
+        let action = TransportAction.looperMute(track: track)
+        let bound = action.flatMap { vm.keyController.bindings[$0] }
+        HStack(spacing: 8) {
+            Button {
+                vm.toggleLooperMute(track)
+            } label: {
+                Text(muted ? "MUTED" : "MUTE")
+                    .font(SMFont.mono(8, weight: .bold))
+                    .tracking(1)
+                    .frame(width: 52)
+                    .padding(.vertical, 5)
+                    .foregroundStyle(muted ? .white : accent.hex)
+                    .background(muted ? Chassis.recRed : accent.dim)
+                    .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            Text(vm.looperTrackLabel(track))
+                .font(SMFont.mono(9, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.85))
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(bound.flatMap { vm.keyController.keyName(for: $0) } ?? "—")
+                .font(SMFont.mono(8))
+                .foregroundStyle(bound != nil ? accent.hex : .white.opacity(0.4))
+            if let action = action {
+                Button(bound == nil ? "LEARN" : "RELEARN") {
+                    vm.startLearning(action)
+                }
+                .font(SMFont.mono(8, weight: .bold))
+                .tracking(1)
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .foregroundStyle(accent.hex)
+                .background(accent.dim)
+                .clipShape(Capsule())
+                if bound != nil {
+                    Button { vm.keyController.unbind(action) } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(Chassis.recRed)
+                            .frame(width: 20, height: 20)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
         }
     }
 }

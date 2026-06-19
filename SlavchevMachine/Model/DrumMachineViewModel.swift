@@ -75,6 +75,12 @@ final class DrumMachineViewModel: ObservableObject {
     @Published var looperFollowStop: Bool = false
     @Published var looperEqBands: [EqBandConfig] = Array(repeating: EqBandConfig(), count: 6)
 
+    // Looper multi-input routing + per-track mute
+    @Published var looperActiveTracks: Int = 1
+    @Published var looperTrackMuted: [Bool] = Array(repeating: false, count: Looper.maxTracks)
+    @Published var looperChannelNames: [String] = []
+    @Published var inputChannelCount: Int = 1
+
     // Scene / setlist
     @Published var setlist: String = ""
     @Published var sceneName: String = "INIT"
@@ -110,6 +116,7 @@ final class DrumMachineViewModel: ObservableObject {
     func bootstrap() {
         do { try audio.start() } catch { print("Audio start failed: \(error)"); return }
         loadKit(.init(name: "cajon", origin: .builtIn))
+        applyLooperRouting()
         startStatePolling()
     }
 
@@ -369,6 +376,46 @@ final class DrumMachineViewModel: ObservableObject {
         audio.looper?.setEqBand(i, cfg)
     }
 
+    // MARK: - Looper routing & per-track mute
+
+    /// Apply the saved Looper Routing to the engine and refresh the UI-facing state.
+    func applyLooperRouting() {
+        audio.applyLooperRouting()
+        refreshLooperRouting()
+    }
+
+    /// Pull track count + channel labels from the engine into published state.
+    func refreshLooperRouting() {
+        looperActiveTracks = audio.looper?.trackCount ?? 1
+        inputChannelCount = audio.availableInputChannelCount()
+        looperChannelNames = audio.inputChannelNames()
+        // Mirror current mute flags from the looper.
+        if let lp = audio.looper {
+            for t in 0..<Looper.maxTracks { looperTrackMuted[t] = lp.isMuted(track: t) }
+        }
+    }
+
+    func toggleLooperMute(_ track: Int) {
+        guard track >= 0 && track < Looper.maxTracks else { return }
+        setLooperMute(track, !looperTrackMuted[track])
+    }
+
+    func setLooperMute(_ track: Int, _ on: Bool) {
+        guard track >= 0 && track < Looper.maxTracks else { return }
+        looperTrackMuted[track] = on
+        audio.looper?.setMuted(track: track, on)
+    }
+
+    /// Label for a routed track (hardware channel name when available, else "INPUT n").
+    func looperTrackLabel(_ track: Int) -> String {
+        let map = audio.looperRoutingMap()
+        if track < map.count {
+            let ch = map[track]
+            if ch < looperChannelNames.count { return looperChannelNames[ch] }
+        }
+        return "INPUT \(track + 1)"
+    }
+
     private func requestMicPermissionIfNeeded(_ completion: @escaping (Bool) -> Void) {
         let session = AVAudioSession.sharedInstance()
         switch session.recordPermission {
@@ -461,11 +508,23 @@ final class DrumMachineViewModel: ObservableObject {
                                        freqHz: b.freqHz, gainDb: b.gainDb, q: b.q, enabled: b.enabled)
                 setLooperEqBand(i, cfg)
             }
-            if lp.hasLoop, let pcm = SceneStore.loadLooperPcm(setlist: setName, name: s.name) {
-                audio.looper?.importLoop(pcm: pcm, barOffsets: lp.barOffsets, latencyComp: lp.latencyComp)
+            let trackCount = lp.trackCount ?? 1
+            let muted = lp.trackMuted ?? Array(repeating: false, count: trackCount)
+            if lp.hasLoop {
+                let tracks = SceneStore.loadLooperTracks(setlist: setName, name: s.name, trackCount: trackCount)
+                if !tracks.isEmpty {
+                    audio.looper?.importTracks(pcms: tracks, barOffsets: lp.barOffsets,
+                                               latencyComp: lp.latencyComp, muted: muted)
+                } else {
+                    audio.looper?.clear()
+                }
             } else {
                 audio.looper?.clear()
             }
+            for t in 0..<Looper.maxTracks {
+                looperTrackMuted[t] = t < muted.count ? muted[t] : false
+            }
+            refreshLooperRouting()
         }
         sceneName = s.name
         setlist = setName
@@ -494,7 +553,9 @@ final class DrumMachineViewModel: ObservableObject {
                           hasLoop: hasLoop,
                           latencyComp: audio.looper?.latencyCompFrames ?? 0,
                           barOffsets: audio.looper?.barOffsets ?? [],
-                          eqBands: lpBands)
+                          eqBands: lpBands,
+                          trackCount: audio.looper?.trackCount ?? 1,
+                          trackMuted: looperTrackMuted)
         )
     }
 
@@ -527,6 +588,8 @@ final class DrumMachineViewModel: ObservableObject {
         case .tempoStepDown: adjustBpm(-Float(SettingsStore.tempoStepDown))
         case .looperRecord: looperTap()
         case .looperStop: looperStop()
+        case .looperMute1, .looperMute2, .looperMute3, .looperMute4:
+            if let t = action.looperMuteTrack { toggleLooperMute(t) }
         }
     }
 

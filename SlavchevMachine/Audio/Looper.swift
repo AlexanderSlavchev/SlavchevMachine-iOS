@@ -25,12 +25,15 @@ enum LooperState: Int {
 
 final class Looper {
     static let maxSeconds = 60
+    /// Max simultaneously-recorded input tracks. Buffers are pre-allocated for all of them
+    /// (RT-safe — never reallocated on the audio path).
+    static let maxTracks = 4
 
     let sampleRate: Float
     let eq = ParametricEqualizer()
 
-    // Allocated once, never reallocated.
-    private var buffer: [Float]
+    // Allocated once, never reallocated. One buffer per track; all tracks share the timeline.
+    private var buffers: [[Float]]
     private var bufferCapacity: Int
 
     // Mutated by ticker / UI thread under transitionLock; read on audio thread.
@@ -49,13 +52,21 @@ final class Looper {
     private(set) var latencyCompFrames: Int = 0
     private var inputGainLin: Float = 1
     private var outputGainLin: Float = 1
-    private var inputPeakValue: Float = 0
+    // Per-track input peak meters. Read/reset by the UI poll.
+    private var inputPeaks: [Float]
+    // How many tracks are in use (routing). Read lock-free on the audio thread.
+    private var activeTracks: Int = 1
+    // Per-track mute. Read lock-free on the audio thread; affects an already-recorded loop live.
+    private var trackMuted: [Bool]
     private var scratch: [Float] = []
 
     init(sampleRate: Float) {
         self.sampleRate = sampleRate
-        self.bufferCapacity = Int(sampleRate) * Looper.maxSeconds
-        self.buffer = Array(repeating: 0, count: bufferCapacity)
+        let capacity = Int(sampleRate) * Looper.maxSeconds
+        self.bufferCapacity = capacity
+        self.buffers = (0..<Looper.maxTracks).map { _ in Array(repeating: 0, count: capacity) }
+        self.inputPeaks = Array(repeating: 0, count: Looper.maxTracks)
+        self.trackMuted = Array(repeating: false, count: Looper.maxTracks)
         eq.setSampleRate(sampleRate)
     }
 
@@ -159,7 +170,7 @@ final class Looper {
             let a = abs(samples[i] * inputGainLin)
             if a > peak { peak = a }
         }
-        if peak > inputPeakValue { inputPeakValue = peak }
+        if peak > inputPeaks[0] { inputPeaks[0] = peak }
 
         // Capture into the loop buffer only when in a recording state.
         let s = LooperState(rawValue: Int(stateRaw)) ?? .empty
@@ -167,10 +178,43 @@ final class Looper {
         var pos = recordLen
         for i in 0..<samples.count {
             if pos >= bufferCapacity { break }
-            buffer[pos] = samples[i] * inputGainLin
+            buffers[0][pos] = samples[i] * inputGainLin
             pos += 1
         }
         recordLen = pos
+    }
+
+    /// Multi-track input: `tracks[i]` is the already-mapped channel for track i. All tracks share
+    /// one timeline so `recordLen` advances once. Lengths are assumed equal (same tap buffer).
+    func appendInput(tracks: [UnsafeBufferPointer<Float>]) {
+        let count = min(tracks.count, activeTracks)
+        guard count > 0 else { return }
+        let g = inputGainLin
+        for t in 0..<count {
+            let src = tracks[t]
+            var peak: Float = 0
+            for i in 0..<src.count {
+                let a = abs(src[i] * g)
+                if a > peak { peak = a }
+            }
+            if peak > inputPeaks[t] { inputPeaks[t] = peak }
+        }
+        let s = LooperState(rawValue: Int(stateRaw)) ?? .empty
+        guard s == .recording || s == .endArmed else { return }
+        let frames = tracks[0].count
+        let start = recordLen
+        for t in 0..<count {
+            let src = tracks[t]
+            let m = min(src.count, frames)
+            var pos = start
+            var i = 0
+            while i < m && pos < bufferCapacity {
+                buffers[t][pos] = src[i] * g
+                pos += 1
+                i += 1
+            }
+        }
+        recordLen = min(start + frames, bufferCapacity)
     }
 
     /// Called by the audio render callback. Mixes mono loop into stereo `out`, applies output gain and EQ.
@@ -191,20 +235,25 @@ final class Looper {
             snapTarget = -1
         }
         let lat = latencyCompFrames
+        let n = activeTracks
         var mixedPeak: Float = 0
         scratch.withUnsafeMutableBufferPointer { sp in
-            for n in 0..<frameCount {
+            for k in 0..<frameCount {
                 let read = (playPos + lat) % loopFrames
-                sp[n] = buffer[read]
+                var acc: Float = 0
+                for t in 0..<n where !trackMuted[t] {
+                    acc += buffers[t][read]
+                }
+                sp[k] = acc
                 playPos += 1
                 if playPos >= loopFrames { playPos = 0 }
             }
             eq.process(sp.baseAddress!, frameCount: frameCount)
             let gain = outputGainLin
-            for n in 0..<frameCount {
-                let v = sp[n] * gain
-                left[n] += v
-                right[n] += v
+            for k in 0..<frameCount {
+                let v = sp[k] * gain
+                left[k] += v
+                right[k] += v
                 if abs(v) > mixedPeak { mixedPeak = abs(v) }
             }
         }
@@ -226,11 +275,44 @@ final class Looper {
     // Live monitoring is handled by AudioEngine via the input → mixer → main-mixer path —
     // not by Looper. (See AudioEngine.setMonitorEnabled.)
 
-    /// Snapshot and reset peak for UI metering.
+    /// Snapshot and reset peak for UI metering — max across active tracks.
     func consumePeak() -> Float {
-        let p = inputPeakValue
-        inputPeakValue = 0
+        var p: Float = 0
+        for t in 0..<activeTracks {
+            if inputPeaks[t] > p { p = inputPeaks[t] }
+            inputPeaks[t] = 0
+        }
         return p
+    }
+
+    /// Per-track peak snapshot (for per-input meters).
+    func consumePeak(track: Int) -> Float {
+        guard track >= 0 && track < Looper.maxTracks else { return 0 }
+        let p = inputPeaks[track]
+        inputPeaks[track] = 0
+        return p
+    }
+
+    // MARK: - Tracks & mute
+
+    var trackCount: Int { activeTracks }
+
+    /// Number of input tracks recorded simultaneously (routing). Clamped to 1...maxTracks.
+    func setActiveTracks(_ n: Int) {
+        os_unfair_lock_lock(&transitionLock)
+        activeTracks = max(1, min(Looper.maxTracks, n))
+        os_unfair_lock_unlock(&transitionLock)
+    }
+
+    /// Mute affects an already-recorded loop in real time (skipped at mix).
+    func setMuted(track: Int, _ on: Bool) {
+        guard track >= 0 && track < Looper.maxTracks else { return }
+        trackMuted[track] = on
+    }
+
+    func isMuted(track: Int) -> Bool {
+        guard track >= 0 && track < Looper.maxTracks else { return false }
+        return trackMuted[track]
     }
 
     // MARK: - Gains, EQ, latency
@@ -244,20 +326,37 @@ final class Looper {
 
     // MARK: - Scene import/export
 
-    func exportPcm() -> [Float] {
+    /// Export each active track's PCM (length = loopFrames). Empty if nothing recorded.
+    func exportTracks() -> [[Float]] {
         let n = loopFrames
         if n <= 0 { return [] }
-        return Array(buffer[0..<n])
+        var out: [[Float]] = []
+        out.reserveCapacity(activeTracks)
+        for t in 0..<activeTracks {
+            out.append(Array(buffers[t][0..<n]))
+        }
+        return out
     }
 
-    func importLoop(pcm: [Float], barOffsets: [Int], latencyComp: Int) {
+    /// Restore a multi-track loop. `pcms` holds one array per track; `muted` restores mute state.
+    func importTracks(pcms: [[Float]], barOffsets: [Int], latencyComp: Int, muted: [Bool]) {
         os_unfair_lock_lock(&transitionLock)
         defer { os_unfair_lock_unlock(&transitionLock) }
-        let n = min(pcm.count, bufferCapacity)
-        for i in 0..<n { buffer[i] = pcm[i] }
-        for i in n..<bufferCapacity { buffer[i] = 0 }
-        loopFrames = n
-        recordLen = n
+        let count = max(1, min(Looper.maxTracks, pcms.count))
+        var maxLen = 0
+        for t in 0..<count {
+            let pcm = pcms[t]
+            let n = min(pcm.count, bufferCapacity)
+            for i in 0..<n { buffers[t][i] = pcm[i] }
+            for i in n..<bufferCapacity { buffers[t][i] = 0 }
+            if n > maxLen { maxLen = n }
+        }
+        activeTracks = count
+        for t in 0..<Looper.maxTracks {
+            trackMuted[t] = t < muted.count ? muted[t] : false
+        }
+        loopFrames = maxLen
+        recordLen = maxLen
         self.barOffsets = barOffsets
         latencyCompFrames = max(0, min(latencyComp, Int(sampleRate) / 2))
         playPos = 0

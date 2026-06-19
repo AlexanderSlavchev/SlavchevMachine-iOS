@@ -62,6 +62,17 @@ enum SettingsStore {
         get { UserDefaults.standard.object(forKey: kLatencyOffset) as? Double ?? 0 }
         set { UserDefaults.standard.set(max(-250, min(250, newValue)), forKey: kLatencyOffset) }
     }
+
+    private static let kLooperRouting = "sm.looper_routing_channels"
+    /// Hardware channel indices (0-based) recorded into looper tracks, in track order
+    /// (track 0..n-1). Default [0] = the original single-channel behavior. Capped at maxTracks.
+    static var looperRoutingChannels: [Int] {
+        get { (UserDefaults.standard.array(forKey: kLooperRouting) as? [Int]) ?? [0] }
+        set {
+            let cleaned = newValue.isEmpty ? [0] : Array(newValue.prefix(Looper.maxTracks))
+            UserDefaults.standard.set(cleaned, forKey: kLooperRouting)
+        }
+    }
 }
 
 enum OnboardingStore {
